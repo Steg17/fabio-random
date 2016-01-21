@@ -82,6 +82,146 @@ The implementation above relies on a storage connection string to be present in 
 Now that our storage controller is defined, our service exposes the APIs needed by the client SDK, so let's look at that next.
 
 ###Client Implementation###
+The File Management Client SDK extends the Mobile App Client SDK with the operations needed to manage and synchronize files. For this example, let's
+take a look at what is needed to enable offline file management and synchronization.
+
+To get started add a reference to the **Microsoft.Azure.Mobile.Client.Files** package (as of this writing, make sure you're including pre-release packages), 
+once the package is installed, we need to initialize the file synchronization context. This allows us to specify the store we want to use to track the file operations and store the file metadata and provide
+an instance of an `IFileSyncHandler`, which is the application logic that decides how to handle file operations and how to read files when they need to be uploaded to the underlying store (more on this later).
+
+If you're updating an existing Mobile App client, you can initialize the file synchronization context with a single line of code:
+
+```csharp
+client.InitializeFileSyncContext(new FileSyncHandler(), store);
+``` 
+
+Here's what the Mobile Apps client code looks like once updated to handle files: 
+
+```csharp
+MobileServiceClient client = new MobileServiceClient("https://<mymobileservice>.azurewebsites.net/");
+
+var store = new MobileServiceSQLiteStore("mydatabase.db");
+store.DefineTable<DataEntity>();
+
+// Code added to initialize the file synchronization context:
+client.InitializeFileSyncContext(new FileSyncHandler(), store);
+
+client.SyncContext.InitializeAsync(store);
+```
+
+With the code above in place, we're ready to start working with files with offline support!
+
+####Managing files####
+As previously mentioned files exist within the context of a record. This means that files managed by the SDK are always
+associated with a data entity, therefore all file management operations are exposed as methods on `IMobileServiceTable` and
+`IMobileServiceSyncTable` when working with offline support.
+
+With that in mind, if we want to create a new file associated with a TodoItem, we can simply call the `AddFileAsync` on the its table:
+```csharp
+await _todoItemTable.AddFileAsync(todoItem, "myfilename");
+``` 
+
+Where `todoItem` is an instance of a `TodoItem` entity and  `_todoItemTable` is an instance of an `IMobileServiceSyncTable<TodoItem>` obtained 
+by calling `GetSyncTable` as you normally would in your Mobile App client:
+```csharp
+// _todoItemTable is a private class variable of type IMobileServiceSyncTable<TodoItem>
+_todoItemTable = client.GetSyncTable<TodoItem>();
+```
+
+To delete a file, you can call the `DeleteFileAsync` method on the table:
+```csharp
+await _todoItemTable.DeleteFileAsync(myfile);
+```
+
+To enumerate files associated with a given data entity, you can simply call the `GetFilesAsync` method:
+```csharp
+IEnumerable<MobileServiceFile> files = await _todoItemTable.GetFilesAsync(todoItem);
+```
+
+It's important to understand that all of the operations described above are working completely offline. There are no network
+calls or data being perstisted to the target storage infrastructure (Azure Blob Storage) when those calls are made.
+
+####Synchronizing files####
+Similar to the way you synchronize table data using the Azure Mobile App Client SDK, in order to persist file changes (upload/delete files), you can 
+simply call the  `PushFileChangesAsync` method on your table:
+```csharp
+await _todoItemTable.PushFileChangesAsync();
+```
+
+Calling this method will begin the process of processing local file operations and taking the appropriate actions against the target store (Azure Blob Storage), this includes
+handling token acquisition when needed to make sure all operations are properly authenticated.
+
+Pulling file changes from the server uses a process based on synchronization triggers. We won't delve into the details of how synchronization triggers work (another topic for another post), 
+but with the default trigger that comes "out of the box", the file synchronization takes place as part of the standard data synchronization process that is part of the Azure Mobile Apps Client SDK,
+so calling `PullAsync` on your sync table will retrieve all file operations that have taken place since your last synchronization for those entities and initiate the synchronization process.
+
+```csharp
+await _todoItemTable.PullAsync("todoitems", string.Empty);
+```    
+
+###The IFileSyncHandler###
+As promised, let's now get back to the `IFileSyncHandler` object. 
+
+After going through the examples above, the more observant readers are probably wondering where files are saved when downloaded and read from when uploaded to the
+target store. Well, my friends, that is where the `IFileSyncHandler` comes into play.
+
+As previously mentioned, the concrete implementation of an `IFileSyncHandler` is **part of your application logic**, that means that utimately, you decide where, how and **if** files should be
+stored on the local device and, as a result, the SDK also asks the synchronization handler for a file data reference when it actually needs to read a file (as in the case of an upload).
+
+With two methods, the `IFileSyncHandler` is a simple interface to implement, but it has an important job and gives you the flexibility to decide how to handle file operations.
+
+Let's take a look at a sample implementation of a file synchronization handler:
+
+```csharp
+public class FileSyncHandler : IFileSyncHandler
+{
+    private readonly IMobileServiceSyncTable<TodoItem> _todoItemTable;
+
+    public FileSyncHandler(IMobileServiceSyncTable<TodoItem> todoItemTable)
+    {
+        _todoItemTable = todoItemTable;
+    }
+
+    public async Task<IMobileServiceFileDataSource> GetDataSource(MobileServiceFileMetadata metadata)
+    {
+        string filePath = ResolvePathForMyApplication(metadata.ParentDataItemType, metadata.ParentDataItemId);
+
+        return new PathMobileServiceFileDataSource(filePath);
+    }
+
+    public async Task ProcessFileSynchronizationAction(MobileServiceFile file, FileSynchronizationAction action)
+    {
+        if (action == FileSynchronizationAction.Create || action == FileSynchronizationAction.Update)
+        {
+            // Look for user defined metadata indicating that this file should be automatically downloaded and
+            // available offline:
+            string persistOfflineValue;
+            if (file.Metadata.TryGetValue("AvailableOffline", out persistOfflineValue)
+                && string.Compare(persistOfflineValue, "true", StringComparison.OrdinalIgnoreCase) == 0)
+            {
+                // File should be available offline, resolve the path and download it:
+                string filePath = ResolvePathForMyApplication(file.TableName, file.ParentId);
+                await _todoItemTable.DownloadFileAsync(file, filePath);
+            }
+        }
+        else if (action == FileSynchronizationAction.Delete)
+        {
+            // Delete file if it exists...
+        }
+   }
+
+    private string ResolvePathForMyApplication(string parentDataItemType, string parentDataItemId)
+    {
+        ...
+        // custom application logic to decide where files should be stored.
+        ...
+    }
+}
+```
+
+In the example above, we have a simple file sync handler that conditionally downloads files when they become available (or are updated), 
+based on a user defined property (which is fully controlled by the application code), essentially deciding that only some of the files, not all, should be available
+if the device is taken offline. As you can see, the handler also decides where those files should be persisted and read from.
 
 ##Summary##
 The Mobile Apps File Management SDK makes working with files in mobile applications using Azure Mobile Apps simple, without compromising on recommended practices 
