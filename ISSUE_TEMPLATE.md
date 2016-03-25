@@ -1,8 +1,8 @@
-###Summary
-###Expected behavior
-###Actual behavior
-###Steps to reproduce
-####function.json contents
+### Summary
+### Expected behavior
+### Actual behavior
+### Steps to reproduce
+#### function.json contents
 `json
 If applicable, paste your function.json contents here
 `
